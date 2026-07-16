@@ -21,7 +21,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import nonebot
-from nonebot import logger, on_keyword, on_message, on_notice, require
+from nonebot import logger, on_command, on_message, on_notice, require
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
 from nonebot.rule import is_type
 
@@ -399,9 +399,9 @@ async def _track_emoji_like(bot: Bot, event: Event) -> None:
     await _refresh_message(bot, owner)
 
 
-# on_keyword 会在消息纯文本中出现关键字时触发，符合“识别到关键字”的需求。
-rank_query = on_keyword(
-    {"今日猴榜"}, rule=is_type(GroupMessageEvent), priority=10, block=False
+# 使用 NoneBot 标准命令响应器；命令前缀遵循项目的 command_start 配置。
+rank_query = on_command(
+    "今日猴榜", rule=is_type(GroupMessageEvent), priority=10, block=True
 )
 
 
