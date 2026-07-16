@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nonebot-plugin-todaymonkeytop"
+version = "0.1.0"
+description = "统计群聊今日收到🐵表情回应的 NoneBot2 插件"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+classifiers = [
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "nonebot2>=2.5.0,<3.0.0",
+    "nonebot-adapter-onebot>=2.4.6",
+    "nonebot-plugin-apscheduler>=0.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ASCll/nonebot_plugin_todaymonkeytop"
+
+[tool.setuptools.packages.find]
+include = ["nonebot_plugin_todaymonkeytop*"]

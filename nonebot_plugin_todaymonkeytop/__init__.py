@@ -1,315 +1,472 @@
-"""nonebot_plugin_todaymonkeytop - 今日猴榜
+"""群聊「今日猴榜」插件。
 
-统计今天群内消息收到的🐵表情回复，生成排行榜。
+本插件会在内存中保留当天群消息的 ``message_id -> 发送者`` 映射。NapCat 上报
+``group_msg_emoji_like`` 时，插件调用 ``get_emoji_likes`` 获取该消息现在
+拥有的完整猴子回应列表，并将数量作为消息快照保存。因此重复事件和撤销回应
+都不会导致榜单被重复计数。
 
-工作原理:
-  1. 依赖 nonebot_plugin_chatrecorder 获取今日消息列表
-  2. 通过 uninfo ORM 批量解析发送者 user_id
-  3. 调用 NapCat get_emoji_likes API 查询每条消息的🐵表情回复
-  4. 聚合每人的🐵表情收入并排行
-
-依赖:
-  - NapCatQQ (get_emoji_likes API)
-  - nonebot_plugin_chatrecorder (消息记录)
-  - nonebot_plugin_uninfo (会话数据 ORM)
+依赖：
+    - nonebot2 >= 2.5.0
+    - nonebot-adapter-onebot
+    - nonebot-plugin-apscheduler
+    - NapCat（需启用 OneBot 11 的群消息和 notice 事件）
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from nonebot import on_command, logger, require
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, permission
-from nonebot.params import CommandArg
+import nonebot
+from nonebot import logger, on_keyword, on_message, on_notice, require
+from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
+from nonebot.rule import is_type
 
-require("nonebot_plugin_chatrecorder")
-require("nonebot_plugin_uninfo")
-
-from nonebot_plugin_chatrecorder import get_message_records
-from nonebot_plugin_chatrecorder.model import MessageRecord
-from nonebot_plugin_orm import get_session
-from nonebot_plugin_uninfo.orm import SessionModel, UserModel
-from sqlalchemy import select
-
-# ==================== 常量 ====================
-
-BATCH_CONCURRENCY = 10
-PROGRESS_INTERVAL = 50
+# NoneBot 没有内置定时器；该插件是发布每日榜单所必需的依赖。
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_apscheduler import scheduler
 
 
-# ==================== 工具函数 ====================
+PLUGIN_NAME = "今日猴榜"
+MONKEY_EMOJI_ID = "128053"
+TOP_LIMIT = 10
+TIME_ZONE = ZoneInfo("Asia/Shanghai")
 
 
-def _today_start_cst_utc() -> datetime:
-    """获取今天 00:00:00 (UTC+8) 对应的 UTC datetime。"""
-    now = datetime.now(timezone(timedelta(hours=8)))
-    return now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+def _now() -> datetime:
+    """返回上海时区的当前时间。"""
+    return datetime.now(TIME_ZONE)
 
 
-async def _build_msg_user_map(records: list[MessageRecord]) -> dict[str, int]:
-    """通过 uninfo ORM 批量查询 message_id → user_id。"""
-    persist_ids = list({r.session_persist_id for r in records})
-    if not persist_ids:
-        return {}
+def _day_from_timestamp(timestamp: Any) -> str:
+    """将 OneBot 时间戳转换为上海日期；缺失或异常时使用当前日期。"""
+    try:
+        return datetime.fromtimestamp(int(timestamp), TIME_ZONE).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return _now().date().isoformat()
 
-    async with get_session() as db_session:
-        stmt = (
-            select(SessionModel.id, UserModel.user_id)
-            .join(UserModel, UserModel.id == SessionModel.user_persist_id)
-            .where(SessionModel.id.in_(persist_ids))
+
+def _today() -> str:
+    return _now().date().isoformat()
+
+
+def _display_name(event: GroupMessageEvent) -> str:
+    """优先使用群名片，其次 QQ 昵称。"""
+    sender = event.sender
+    return str(sender.card or sender.nickname or event.user_id)
+
+
+@dataclass(frozen=True)
+class MessageOwner:
+    """一条群消息及其归属用户。"""
+
+    day: str
+    bot_id: str
+    group_id: int
+    message_id: str
+    user_id: int
+    nickname: str
+
+
+class MonkeyStore:
+    """仅驻留在进程内存中的当天数据。
+
+    磁盘 SQLite 持久化已按当前需求停用；进程重启会清空排行榜数据。
+    """
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.messages: dict[tuple[str, int, str], MessageOwner] = {}
+        self.reaction_counts: dict[tuple[str, int, str, str], int] = {}
+        self.sent_reports: set[tuple[str, str, int]] = set()
+        logger.info("todaymonkeytop: 已启用纯内存统计，磁盘持久化已停用")
+
+    async def save_message(self, owner: MessageOwner, message_time: int | None) -> None:
+        del message_time
+        async with self.lock:
+            self.messages[(owner.bot_id, owner.group_id, owner.message_id)] = owner
+
+    async def get_message(
+        self, bot_id: str, group_id: int, message_id: str
+    ) -> MessageOwner | None:
+        async with self.lock:
+            return self.messages.get((bot_id, group_id, message_id))
+
+    async def messages_for_group(
+        self, day: str, bot_id: str, group_id: int
+    ) -> list[MessageOwner]:
+        async with self.lock:
+            rows = [
+                owner
+                for owner in self.messages.values()
+                if owner.day == day
+                and owner.bot_id == bot_id
+                and owner.group_id == group_id
+            ]
+        return sorted(rows, key=lambda owner: owner.message_id)
+
+    async def save_reaction_count(
+        self, owner: MessageOwner, count: int
+    ) -> None:
+        async with self.lock:
+            self.reaction_counts[
+                (owner.bot_id, owner.group_id, owner.message_id, MONKEY_EMOJI_ID)
+            ] = count
+
+    async def ranking(
+        self, day: str, bot_id: str, group_id: int
+    ) -> list[tuple[int, str, int]]:
+        async with self.lock:
+            totals: dict[int, int] = {}
+            names: dict[int, str] = {}
+            for owner in self.messages.values():
+                if (owner.day, owner.bot_id, owner.group_id) != (day, bot_id, group_id):
+                    continue
+                count = self.reaction_counts.get(
+                    (owner.bot_id, owner.group_id, owner.message_id, MONKEY_EMOJI_ID), 0
+                )
+                if count:
+                    totals[owner.user_id] = totals.get(owner.user_id, 0) + count
+                    names[owner.user_id] = owner.nickname or str(owner.user_id)
+        return sorted(
+            ((user_id, names[user_id], count) for user_id, count in totals.items()),
+            key=lambda row: (-row[2], row[0]),
         )
-        rows = (await db_session.execute(stmt)).all()
-        session_user_map: dict[int, int] = {
-            row[0]: int(row[1]) for row in rows if row[1] is not None
-        }
 
-    mapping: dict[str, int] = {}
-    for r in records:
-        uid = session_user_map.get(r.session_persist_id)
-        if uid is not None:
-            mapping[r.message_id] = uid
-    return mapping
+    async def groups_for_day(self, day: str) -> list[tuple[str, int]]:
+        async with self.lock:
+            groups = {
+                (owner.bot_id, owner.group_id)
+                for owner in self.messages.values()
+                if owner.day == day
+            }
+        return sorted(groups)
+
+    async def report_already_sent(self, day: str, bot_id: str, group_id: int) -> bool:
+        async with self.lock:
+            return (day, bot_id, group_id) in self.sent_reports
+
+    async def mark_report_sent(self, day: str, bot_id: str, group_id: int) -> None:
+        async with self.lock:
+            self.sent_reports.add((day, bot_id, group_id))
+
+    async def prune(self, keep_days: int = 14) -> None:
+        """清理过期内存数据，防止长期运行时内存无限增长。"""
+        cutoff = (_now().date() - timedelta(days=keep_days)).isoformat()
+        async with self.lock:
+            self.messages = {
+                key: owner for key, owner in self.messages.items() if owner.day >= cutoff
+            }
+            valid_messages = set(self.messages)
+            self.reaction_counts = {
+                key: count
+                for key, count in self.reaction_counts.items()
+                if key[:3] in valid_messages
+            }
+            self.sent_reports = {
+                report for report in self.sent_reports if report[0] >= cutoff
+            }
 
 
-async def _check_message(
-    bot: Bot,
-    record: MessageRecord,
-    emoji_ids: list[str],
-    msg_user_map: dict[str, int],
-    group_id: int,
-) -> tuple[int, int, int] | None:
-    """检查单条消息，返回 (user_id, monkey_count, failed_count) 或 None。"""
-    target_uid = msg_user_map.get(record.message_id)
-    if target_uid is None:
+store = MonkeyStore()
+
+
+async def _get_monkey_count(bot: Bot, message_id: str) -> int:
+    """调用 NapCat API，返回消息当前被贴猴子的用户数。"""
+    result: Any = await bot.call_api(
+        "get_emoji_likes",
+        message_id=message_id,
+        emoji_id=MONKEY_EMOJI_ID,
+        count=0,  # NapCat 文档：0 表示读取全部
+    )
+    if not isinstance(result, dict):
+        raise TypeError(f"get_emoji_likes 返回了 {type(result).__name__}，期望 dict")
+    data = result.get("data")
+    if not isinstance(data, dict):
+        raise ValueError(f"get_emoji_likes 缺少 data：{result!r}")
+    likes = data.get("emoji_like_list")
+    if not isinstance(likes, list):
+        raise ValueError(f"get_emoji_likes 缺少 emoji_like_list：{data!r}")
+    return len(likes)
+
+
+async def _refresh_message(bot: Bot, owner: MessageOwner) -> bool:
+    """刷新一条消息的猴子快照；失败会记录完整上下文并返回 False。"""
+    try:
+        count = await _get_monkey_count(bot, owner.message_id)
+        await store.save_reaction_count(owner, count)
+        logger.info(
+            "todaymonkeytop: 刷新回应 gid={} msg={} target={} monkey_count={}",
+            owner.group_id,
+            owner.message_id,
+            owner.user_id,
+            count,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "todaymonkeytop: 刷新回应失败 gid={} msg={} target={}",
+            owner.group_id,
+            owner.message_id,
+            owner.user_id,
+        )
+        return False
+
+
+async def _refresh_group(bot: Bot, group_id: int, day: str) -> tuple[int, int]:
+    """并发刷新一个群当天全部已记录消息的猴子快照。"""
+    owners = await store.messages_for_group(day, str(bot.self_id), group_id)
+    if not owners:
+        return (0, 0)
+
+    semaphore = asyncio.Semaphore(8)
+
+    async def refresh_with_limit(owner: MessageOwner) -> bool:
+        async with semaphore:
+            return await _refresh_message(bot, owner)
+
+    results = await asyncio.gather(*(refresh_with_limit(owner) for owner in owners))
+    success = sum(results)
+    failures = len(results) - success
+    logger.info(
+        "todaymonkeytop: 群刷新完成 gid={} day={} messages={} success={} failures={}",
+        group_id,
+        day,
+        len(owners),
+        success,
+        failures,
+    )
+    return success, failures
+
+
+async def _resolve_owner_from_api(
+    bot: Bot, group_id: int, message_id: str
+) -> MessageOwner | None:
+    """缓存未命中时，尝试用标准 OneBot ``get_msg`` 补回消息发送者。"""
+    try:
+        result: Any = await bot.call_api("get_msg", message_id=message_id)
+        if not isinstance(result, dict) or result.get("user_id") is None:
+            logger.warning(
+                "todaymonkeytop: get_msg 无法解析发送者 gid={} msg={} result={!r}",
+                group_id,
+                message_id,
+                result,
+            )
+            return None
+        message_group = result.get("group_id")
+        if message_group is not None and int(message_group) != group_id:
+            logger.warning(
+                "todaymonkeytop: get_msg 群号不一致 event_gid={} api_gid={} msg={}",
+                group_id,
+                message_group,
+                message_id,
+            )
+            return None
+        sender = result.get("sender") if isinstance(result.get("sender"), dict) else {}
+        nickname = str(sender.get("card") or sender.get("nickname") or result["user_id"])
+        owner = MessageOwner(
+            day=_day_from_timestamp(result.get("time")),
+            bot_id=str(bot.self_id),
+            group_id=group_id,
+            message_id=message_id,
+            user_id=int(result["user_id"]),
+            nickname=nickname,
+        )
+        await store.save_message(owner, int(result["time"]) if result.get("time") else None)
+        logger.info(
+            "todaymonkeytop: get_msg 回补消息映射 gid={} msg={} target={} day={}",
+            group_id,
+            message_id,
+            owner.user_id,
+            owner.day,
+        )
+        return owner
+    except Exception:
+        logger.exception(
+            "todaymonkeytop: get_msg 回补失败 gid={} msg={}", group_id, message_id
+        )
         return None
 
-    monkey_count = 0
-    failed = 0
-    for eid in emoji_ids:
+
+def _render_ranking(
+    rows: list[tuple[int, str, int]], *, day: str, refresh_failures: int = 0
+) -> str:
+    """渲染不超过十名的纯文本排行榜。"""
+    now_text = _now().strftime("%H:%M")
+    lines = ["🐵【今日猴榜】🐵", f"统计日期：{day}（截至 {now_text}）", "━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("今天还没有人收到 🐵 表情。")
+    else:
+        medals = ("🥇", "🥈", "🥉")
+        for index, (user_id, nickname, count) in enumerate(rows[:TOP_LIMIT], start=1):
+            prefix = medals[index - 1] if index <= len(medals) else f"{index:>2}."
+            lines.append(f"{prefix} {nickname}（{user_id}） × {count} 🐵")
+        if len(rows) > TOP_LIMIT:
+            lines.append(f"另有 {len(rows) - TOP_LIMIT} 人未展示")
+    lines.append("━━━━━━━━━━━━")
+    if refresh_failures:
+        lines.append(f"⚠️ {refresh_failures} 条消息的回应读取失败，结果可能不完整")
+    return "\n".join(lines)
+
+
+# 所有群消息均保存映射。block=False 避免影响其他插件的消息处理。
+group_message_tracker = on_message(
+    rule=is_type(GroupMessageEvent), priority=20, block=False
+)
+
+
+@group_message_tracker.handle()
+async def _track_group_message(bot: Bot, event: GroupMessageEvent) -> None:
+    if str(event.user_id) == str(bot.self_id):
+        logger.debug(
+            "todaymonkeytop: 忽略机器人自身消息 gid={} msg={}",
+            event.group_id,
+            event.message_id,
+        )
+        return
+
+    owner = MessageOwner(
+        day=_day_from_timestamp(event.time),
+        bot_id=str(bot.self_id),
+        group_id=event.group_id,
+        message_id=str(event.message_id),
+        user_id=event.user_id,
+        nickname=_display_name(event),
+    )
+    await store.save_message(owner, int(event.time) if event.time else None)
+    logger.debug(
+        "todaymonkeytop: 已记录群消息 gid={} msg={} target={} day={}",
+        owner.group_id,
+        owner.message_id,
+        owner.user_id,
+        owner.day,
+    )
+
+
+# NapCat 的 group_msg_emoji_like 是 OneBot notice 扩展事件；保留为通用事件以
+# 兼容 adapter-onebot 尚未声明该扩展类型的版本。
+emoji_like_listener = on_notice(priority=20, block=False)
+
+
+@emoji_like_listener.handle()
+async def _track_emoji_like(bot: Bot, event: Event) -> None:
+    if getattr(event, "notice_type", None) != "group_msg_emoji_like":
+        return
+
+    group_id = getattr(event, "group_id", None)
+    message_id = getattr(event, "message_id", None)
+    likes = getattr(event, "likes", None)
+    if group_id is None or message_id is None or not isinstance(likes, list):
+        logger.warning("todaymonkeytop: 忽略字段不完整的表情回应事件：{!r}", event)
+        return
+
+    def emoji_id_of(item: Any) -> Any:
+        if isinstance(item, dict):
+            return item.get("emoji_id")
+        return getattr(item, "emoji_id", None)
+
+    has_monkey = any(str(emoji_id_of(item)) == MONKEY_EMOJI_ID for item in likes)
+    if not has_monkey:
+        return
+
+    group_id = int(group_id)
+    message_id = str(message_id)
+    is_add = getattr(event, "is_add", None)
+    logger.info(
+        "todaymonkeytop: 收到猴子回应事件 gid={} msg={} operator={} is_add={}",
+        group_id,
+        message_id,
+        getattr(event, "user_id", None),
+        is_add,
+    )
+
+    owner = await store.get_message(str(bot.self_id), group_id, message_id)
+    if owner is None:
+        owner = await _resolve_owner_from_api(bot, group_id, message_id)
+    if owner is None:
+        return
+    if owner.day != _today():
         logger.info(
-            f"monkeytop: 查 msg={record.message_id} "
-            f"gid={group_id} emoji={eid}"
+            "todaymonkeytop: 忽略非今日消息的回应 gid={} msg={} message_day={}",
+            group_id,
+            message_id,
+            owner.day,
         )
-        try:
-            result: Any = await bot.call_api(
-                "get_emoji_likes",
-                message_id=record.message_id,
-                emoji_id=str(eid),
-                group_id=str(group_id),
-                count=20,
-            )
+        return
+    await _refresh_message(bot, owner)
+
+
+# on_keyword 会在消息纯文本中出现关键字时触发，符合“识别到关键字”的需求。
+rank_query = on_keyword(
+    {"今日猴榜"}, rule=is_type(GroupMessageEvent), priority=10, block=False
+)
+
+
+@rank_query.handle()
+async def _show_current_ranking(bot: Bot, event: GroupMessageEvent) -> None:
+    day = _today()
+    logger.info(
+        "todaymonkeytop: 收到榜单查询 gid={} requester={} day={}",
+        event.group_id,
+        event.user_id,
+        day,
+    )
+    await rank_query.send("🐵 正在刷新今日猴榜，请稍候…")
+    _, failures = await _refresh_group(bot, event.group_id, day)
+    rows = await store.ranking(day, str(bot.self_id), event.group_id)
+    await rank_query.finish(_render_ranking(rows, day=day, refresh_failures=failures))
+
+
+@scheduler.scheduled_job(
+    "cron",
+    hour=23,
+    minute=59,
+    timezone="Asia/Shanghai",
+    id="nonebot_plugin_todaymonkeytop_daily_rank",
+)
+async def _send_daily_rankings() -> None:
+    """在每天 23:59 向当天有记录消息的群发送榜单。"""
+    day = _today()
+    groups = await store.groups_for_day(day)
+    bots = nonebot.get_bots()
+    logger.info(
+        "todaymonkeytop: 开始每日结算 day={} groups={} online_bots={}",
+        day,
+        len(groups),
+        len(bots),
+    )
+    for bot_id, group_id in groups:
+        if await store.report_already_sent(day, bot_id, group_id):
             logger.info(
-                f"monkeytop: 响应: {str(result)[:300]}"
+                "todaymonkeytop: 今日榜单已发送，跳过 gid={} bot={}", group_id, bot_id
             )
-            if not isinstance(result, dict):
-                logger.warning(
-                    f"monkeytop: result 不是 dict: type={type(result).__name__}"
-                )
-                failed += 1
-                continue
-            data = result.get("data")
-            if data is None:
-                logger.warning(
-                    f"monkeytop: data=None msg={record.message_id}"
-                )
-            elif isinstance(data, dict):
-                likes_list = data.get("emoji_like_list")
-                if isinstance(likes_list, list):
-                    monkey_count += len(likes_list)
-                    logger.info(
-                        f"monkeytop: msg={record.message_id} 找到 "
-                        f"{len(likes_list)} 条表情回复"
-                    )
-                else:
-                    logger.warning(
-                        f"monkeytop: emoji_like_list 不是 list: "
-                        f"type={type(likes_list).__name__} "
-                        f"data_keys={list(data.keys())}"
-                    )
-            else:
-                logger.warning(
-                    f"monkeytop: data 不是 dict: type={type(data).__name__}"
-                )
-        except Exception as exc:
-            logger.error(
-                f"monkeytop: 失败 msg={record.message_id} emoji={eid}: {exc}"
+            continue
+        raw_bot = bots.get(bot_id)
+        if not isinstance(raw_bot, Bot):
+            logger.warning(
+                "todaymonkeytop: 无法发送 gid={}，机器人 {} 当前不在线",
+                group_id,
+                bot_id,
             )
-            failed += 1
-
-    return (target_uid, monkey_count, failed)
-
-
-# ==================== 今日猴榜命令 ====================
-
-_monkey_cmd = on_command("今日猴榜", permission=permission.GROUP, priority=10, block=True)
-
-
-@_monkey_cmd.handle()
-async def _handle_monkey_ranking(
-    bot: Bot,
-    event: GroupMessageEvent,
-    args: Any = CommandArg(),
-) -> None:
-    """处理 '今日猴榜' 命令，统计并展示排行榜。"""
-    group_id = event.group_id
-    await _monkey_cmd.send("🐵 正在统计今日猴榜，请稍候...")
-
-    # ---- 从 chatrecorder 加载今日消息 ----
-    today_start = _today_start_cst_utc()
-
-    records: list[MessageRecord] = await get_message_records(
-        scene_ids=[str(group_id)],
-        time_start=today_start,
-        types=["message"],
-    )
-
-    if not records:
-        await _monkey_cmd.finish("今天群里还没有消息记录喵～")
-
-    # ---- 解析自定义表情 ID ----
-    custom_ids: list[str] | None = None
-    text = args.extract_plain_text().strip()
-    if text:
-        custom_ids = [x.strip() for x in text.replace("，", ",").split(",") if x.strip()]
-
-    emoji_ids = custom_ids or ["128053"]
-    total_msgs = len(records)
-    total_calls = total_msgs * len(emoji_ids)
-
-    await _monkey_cmd.send(
-        f"今日共 {total_msgs} 条消息，需检查 {total_calls} 次 API 调用\n"
-        f"表情ID: {', '.join(emoji_ids)}\n"
-        f"正在并发处理（每批 {BATCH_CONCURRENCY} 条），请稍候..."
-    )
-
-    # ---- 构建 message_id → user_id 映射 ----
-    msg_user_map = await _build_msg_user_map(records)
-    if not msg_user_map:
-        await _monkey_cmd.finish("无法解析消息发送者信息喵～")
-
-    # ---- 并发检查所有消息 ----
-    user_counts: dict[int, int] = defaultdict(int)
-    total_checked = 0
-    total_failed = 0
-    first_errors: list[str] = []
-    ERROR_LOG_LIMIT = 3
-    last_progress = 0
-
-    for batch_start in range(0, total_msgs, BATCH_CONCURRENCY):
-        batch = records[batch_start:batch_start + BATCH_CONCURRENCY]
-        tasks = [
-            _check_message(bot, r, emoji_ids, msg_user_map, group_id)
-            for r in batch
-        ]
-        batch_results = await asyncio.gather(*tasks)
-
-        for record, result in zip(batch, batch_results):
-            if result is not None:
-                uid, count, failed = result
-                if count:
-                    user_counts[uid] += count
-                total_checked += 1
-                total_failed += failed
-                if failed and len(first_errors) < ERROR_LOG_LIMIT:
-                    first_errors.append(
-                        f"msg={record.message_id} "
-                        f"failed={failed}/{len(emoji_ids)}"
-                    )
-
-        # 进度汇报
-        processed = batch_start + len(batch)
-        if processed - last_progress >= PROGRESS_INTERVAL or processed >= total_msgs:
-            last_progress = processed
-            done_calls = processed * len(emoji_ids)
-            try:
-                await _monkey_cmd.send(
-                    f"⏳ 进度: {processed}/{total_msgs} 条消息"
-                    f"（{done_calls}/{total_calls} API 调用）"
-                )
-            except Exception:
-                pass
-
-    for err in first_errors:
-        logger.warning(f"monkeytop: get_emoji_likes 部分失败 - {err}")
-
-    if not user_counts:
-        tail = ""
-        if total_failed:
-            tail = (
-                f"\n（{total_failed} 次 API 调用失败，"
-                f"可能消息已过期或 NapCat 版本不支持）"
-            )
-        await _monkey_cmd.finish(
-            f"检查完毕（{total_checked} 条消息）"
-            f"，今天没有人收到🐵表情喵～{tail}"
-        )
-
-    # ---- 排序 + 查昵称 ----
-    sorted_users = sorted(user_counts.items(), key=lambda x: -x[1])
-
-    lines = ["🐵【今日猴榜】🐵", "━" * 20]
-    medals = ["🥇", "🥈", "🥉"]
-
-    for i, (uid, count) in enumerate(sorted_users[:10]):
+            continue
         try:
-            info: Any = await bot.call_api(
-                "get_stranger_info", user_id=uid, no_cache=True
+            _, failures = await _refresh_group(raw_bot, group_id, day)
+            rows = await store.ranking(day, bot_id, group_id)
+            message = _render_ranking(rows, day=day, refresh_failures=failures)
+            await raw_bot.send_group_msg(group_id=group_id, message=message)
+            await store.mark_report_sent(day, bot_id, group_id)
+            logger.info(
+                "todaymonkeytop: 每日榜单发送成功 gid={} bot={} entries={}",
+                group_id,
+                bot_id,
+                len(rows),
             )
-            name = info.get("nickname", str(uid)) if isinstance(info, dict) else str(uid)
         except Exception:
-            name = str(uid)
-        prefix = medals[i] if i < 3 else f"  {i + 1}. "
-        lines.append(f"{prefix} {name}  × {count} 🐵")
-
-    extra_lines: list[str] = [
-        "━" * 20,
-        f"共检查 {total_checked} 条消息",
-    ]
-    if len(sorted_users) > 10:
-        extra_lines.append(f"（还有 {len(sorted_users) - 10} 人未显示）")
-    if total_failed:
-        extra_lines.append(f"（{total_failed} 次 API 调用失败）")
-    extra_lines.append(f"表情ID: {', '.join(emoji_ids)}")
-
-    await _monkey_cmd.finish("\n".join(lines + extra_lines))
-
-
-# ==================== 测试命令 ====================
-
-_test_cmd = on_command("猴榜测试", permission=permission.GROUP, priority=10, block=True)
-
-
-@_test_cmd.handle()
-async def _handle_test(bot: Bot, event: GroupMessageEvent) -> None:
-    """用当前消息的 message_id 测试 fetch_emoji_like 是否可用。"""
-    msg_id = event.message_id
-    await _test_cmd.send(f"正在测试 msg={msg_id}...")
-
-    for eid in ("128053", "76", "0"):
-        for etype in (1, 2):
-            try:
-                result = await bot.call_api(
-                    "fetch_emoji_like",
-                    message_id=msg_id,
-                    emojiId=eid,
-                    emojiType=etype,
-                    count=20,
-                    cookie="",
-                )
-                data = result.get("data") if isinstance(result, dict) else {}
-                likes = data.get("emojiLikesList")
-                count = len(likes) if isinstance(likes, list) else "N/A"
-                await _test_cmd.send(
-                    f"fetch_emoji_like(msg={msg_id}, id={eid}, type={etype}) → "
-                    f"count={count}, keys={list(data.keys())[:5]}"
-                )
-                return  # 找到能用的就不继续试了
-            except Exception as exc:
-                await _test_cmd.send(
-                    f"fetch_emoji_like(msg={msg_id}, id={eid}, type={etype}) → "
-                    f"失败: {exc}"
-                )
-
+            logger.exception(
+                "todaymonkeytop: 每日榜单发送失败 gid={} bot={}", group_id, bot_id
+            )
+    await store.prune()
+    logger.info("todaymonkeytop: 每日结算完成 day={}", day)
