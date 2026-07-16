@@ -1,6 +1,6 @@
 """群聊「今日猴榜」插件。
 
-本插件会在内存中保留当天群消息的 ``message_id -> 发送者`` 映射。NapCat 上报
+本插件会将当天群消息的 ``message_id -> 发送者`` 映射持久化到 SQLite。NapCat 上报
 ``group_msg_emoji_like`` 时，插件调用 ``get_emoji_likes`` 获取该消息现在
 拥有的完整猴子回应列表，并将数量作为消息快照保存。因此重复事件和撤销回应
 都不会导致榜单被重复计数。
@@ -24,10 +24,15 @@ import nonebot
 from nonebot import logger, on_command, on_message, on_notice, require
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
 from nonebot.rule import is_type
+from sqlalchemy import delete, func, select
 
 # NoneBot 没有内置定时器；该插件是发布每日榜单所必需的依赖。
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
+require("nonebot_plugin_orm")
+from nonebot_plugin_orm import get_session
+
+from .models import MonkeyDailyReport, MonkeyMessage, MonkeyReaction
 
 
 PLUGIN_NAME = "今日猴榜"
@@ -72,103 +77,185 @@ class MessageOwner:
 
 
 class MonkeyStore:
-    """仅驻留在进程内存中的当天数据。
-
-    磁盘 SQLite 持久化已按当前需求停用；进程重启会清空排行榜数据。
-    """
+    """基于 nonebot-plugin-orm 的持久化读写层。"""
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
-        self.messages: dict[tuple[str, int, str], MessageOwner] = {}
-        self.reaction_counts: dict[tuple[str, int, str, str], int] = {}
-        self.sent_reports: set[tuple[str, str, int]] = set()
-        logger.info("todaymonkeytop: 已启用纯内存统计，磁盘持久化已停用")
+        logger.info("todaymonkeytop: 已启用 nonebot-plugin-orm 持久化")
 
     async def save_message(self, owner: MessageOwner, message_time: int | None) -> None:
-        del message_time
         async with self.lock:
-            self.messages[(owner.bot_id, owner.group_id, owner.message_id)] = owner
+            session = get_session()
+            async with session.begin():
+                record = await session.get(
+                    MonkeyMessage,
+                    (owner.bot_id, owner.group_id, owner.message_id),
+                )
+                if record is None:
+                    session.add(
+                        MonkeyMessage(
+                            bot_id=owner.bot_id,
+                            group_id=owner.group_id,
+                            message_id=owner.message_id,
+                            day=owner.day,
+                            user_id=owner.user_id,
+                            nickname=owner.nickname,
+                            message_time=message_time,
+                        )
+                    )
+                else:
+                    record.nickname = owner.nickname
 
     async def get_message(
         self, bot_id: str, group_id: int, message_id: str
     ) -> MessageOwner | None:
         async with self.lock:
-            return self.messages.get((bot_id, group_id, message_id))
+            session = get_session()
+            async with session.begin():
+                record = await session.get(MonkeyMessage, (bot_id, group_id, message_id))
+                if record is None:
+                    return None
+                return MessageOwner(
+                    day=record.day,
+                    bot_id=record.bot_id,
+                    group_id=record.group_id,
+                    message_id=record.message_id,
+                    user_id=record.user_id,
+                    nickname=record.nickname,
+                )
 
     async def messages_for_group(
         self, day: str, bot_id: str, group_id: int
     ) -> list[MessageOwner]:
         async with self.lock:
-            rows = [
-                owner
-                for owner in self.messages.values()
-                if owner.day == day
-                and owner.bot_id == bot_id
-                and owner.group_id == group_id
-            ]
-        return sorted(rows, key=lambda owner: owner.message_id)
+            session = get_session()
+            async with session.begin():
+                statement = (
+                    select(MonkeyMessage)
+                    .where(
+                        MonkeyMessage.day == day,
+                        MonkeyMessage.bot_id == bot_id,
+                        MonkeyMessage.group_id == group_id,
+                    )
+                    .order_by(MonkeyMessage.message_time, MonkeyMessage.message_id)
+                )
+                records = (await session.scalars(statement)).all()
+                return [
+                    MessageOwner(
+                        day=record.day,
+                        bot_id=record.bot_id,
+                        group_id=record.group_id,
+                        message_id=record.message_id,
+                        user_id=record.user_id,
+                        nickname=record.nickname,
+                    )
+                    for record in records
+                ]
 
     async def save_reaction_count(
         self, owner: MessageOwner, count: int
     ) -> None:
         async with self.lock:
-            self.reaction_counts[
-                (owner.bot_id, owner.group_id, owner.message_id, MONKEY_EMOJI_ID)
-            ] = count
+            session = get_session()
+            async with session.begin():
+                record = await session.get(
+                    MonkeyReaction,
+                    (owner.bot_id, owner.group_id, owner.message_id, MONKEY_EMOJI_ID),
+                )
+                if record is None:
+                    session.add(
+                        MonkeyReaction(
+                            bot_id=owner.bot_id,
+                            group_id=owner.group_id,
+                            message_id=owner.message_id,
+                            emoji_id=MONKEY_EMOJI_ID,
+                            day=owner.day,
+                            reaction_count=count,
+                        )
+                    )
+                else:
+                    record.reaction_count = count
 
     async def ranking(
         self, day: str, bot_id: str, group_id: int
     ) -> list[tuple[int, str, int]]:
         async with self.lock:
-            totals: dict[int, int] = {}
-            names: dict[int, str] = {}
-            for owner in self.messages.values():
-                if (owner.day, owner.bot_id, owner.group_id) != (day, bot_id, group_id):
-                    continue
-                count = self.reaction_counts.get(
-                    (owner.bot_id, owner.group_id, owner.message_id, MONKEY_EMOJI_ID), 0
+            session = get_session()
+            async with session.begin():
+                total = func.sum(MonkeyReaction.reaction_count)
+                statement = (
+                    select(
+                        MonkeyMessage.user_id,
+                        func.max(MonkeyMessage.nickname).label("nickname"),
+                        total.label("reaction_count"),
+                    )
+                    .join(
+                        MonkeyReaction,
+                        (MonkeyReaction.bot_id == MonkeyMessage.bot_id)
+                        & (MonkeyReaction.group_id == MonkeyMessage.group_id)
+                        & (MonkeyReaction.message_id == MonkeyMessage.message_id),
+                    )
+                    .where(
+                        MonkeyMessage.day == day,
+                        MonkeyMessage.bot_id == bot_id,
+                        MonkeyMessage.group_id == group_id,
+                        MonkeyReaction.emoji_id == MONKEY_EMOJI_ID,
+                    )
+                    .group_by(MonkeyMessage.user_id)
+                    .having(total > 0)
+                    .order_by(total.desc(), MonkeyMessage.user_id.asc())
                 )
-                if count:
-                    totals[owner.user_id] = totals.get(owner.user_id, 0) + count
-                    names[owner.user_id] = owner.nickname or str(owner.user_id)
-        return sorted(
-            ((user_id, names[user_id], count) for user_id, count in totals.items()),
-            key=lambda row: (-row[2], row[0]),
-        )
+                rows = (await session.execute(statement)).all()
+                return [
+                    (int(row.user_id), str(row.nickname), int(row.reaction_count))
+                    for row in rows
+                ]
 
     async def groups_for_day(self, day: str) -> list[tuple[str, int]]:
         async with self.lock:
-            groups = {
-                (owner.bot_id, owner.group_id)
-                for owner in self.messages.values()
-                if owner.day == day
-            }
-        return sorted(groups)
+            session = get_session()
+            async with session.begin():
+                statement = (
+                    select(MonkeyMessage.bot_id, MonkeyMessage.group_id)
+                    .where(MonkeyMessage.day == day)
+                    .distinct()
+                    .order_by(MonkeyMessage.bot_id, MonkeyMessage.group_id)
+                )
+                return [
+                    (str(row.bot_id), int(row.group_id))
+                    for row in (await session.execute(statement)).all()
+                ]
 
     async def report_already_sent(self, day: str, bot_id: str, group_id: int) -> bool:
         async with self.lock:
-            return (day, bot_id, group_id) in self.sent_reports
+            session = get_session()
+            async with session.begin():
+                return (
+                    await session.get(MonkeyDailyReport, (day, bot_id, group_id))
+                ) is not None
 
     async def mark_report_sent(self, day: str, bot_id: str, group_id: int) -> None:
         async with self.lock:
-            self.sent_reports.add((day, bot_id, group_id))
+            session = get_session()
+            async with session.begin():
+                if await session.get(MonkeyDailyReport, (day, bot_id, group_id)) is None:
+                    session.add(
+                        MonkeyDailyReport(day=day, bot_id=bot_id, group_id=group_id)
+                    )
 
     async def prune(self, keep_days: int = 14) -> None:
-        """清理过期内存数据，防止长期运行时内存无限增长。"""
+        """删除过期的 SQLite 排行数据。"""
         cutoff = (_now().date() - timedelta(days=keep_days)).isoformat()
         async with self.lock:
-            self.messages = {
-                key: owner for key, owner in self.messages.items() if owner.day >= cutoff
-            }
-            valid_messages = set(self.messages)
-            self.reaction_counts = {
-                key: count
-                for key, count in self.reaction_counts.items()
-                if key[:3] in valid_messages
-            }
-            self.sent_reports = {
-                report for report in self.sent_reports if report[0] >= cutoff
-            }
+            session = get_session()
+            async with session.begin():
+                await session.execute(
+                    delete(MonkeyReaction).where(MonkeyReaction.day < cutoff)
+                )
+                await session.execute(delete(MonkeyMessage).where(MonkeyMessage.day < cutoff))
+                await session.execute(
+                    delete(MonkeyDailyReport).where(MonkeyDailyReport.day < cutoff)
+                )
 
 
 store = MonkeyStore()
@@ -184,12 +271,13 @@ async def _get_monkey_count(bot: Bot, message_id: str) -> int:
     )
     if not isinstance(result, dict):
         raise TypeError(f"get_emoji_likes 返回了 {type(result).__name__}，期望 dict")
+    # NapCat 的 HTTP 原始响应有 data 包装；NoneBot OneBot 适配器的
+    # bot.call_api() 会将该包装解开，直接返回业务数据。两种形式都兼容。
     data = result.get("data")
-    if not isinstance(data, dict):
-        raise ValueError(f"get_emoji_likes 缺少 data：{result!r}")
-    likes = data.get("emoji_like_list")
+    payload = data if isinstance(data, dict) else result
+    likes = payload.get("emoji_like_list")
     if not isinstance(likes, list):
-        raise ValueError(f"get_emoji_likes 缺少 emoji_like_list：{data!r}")
+        raise ValueError(f"get_emoji_likes 缺少 emoji_like_list：{result!r}")
     return len(likes)
 
 
@@ -387,6 +475,13 @@ async def _track_emoji_like(bot: Bot, event: Event) -> None:
     if owner is None:
         owner = await _resolve_owner_from_api(bot, group_id, message_id)
     if owner is None:
+        return
+    if owner.user_id == int(bot.self_id):
+        logger.debug(
+            "todaymonkeytop: 忽略机器人自身消息的回应 gid={} msg={}",
+            group_id,
+            message_id,
+        )
         return
     if owner.day != _today():
         logger.info(
