@@ -389,11 +389,17 @@ def _render_ranking(
         lines.append("今天还没有人收到 🐵 表情。")
     else:
         medals = ("🥇", "🥈", "🥉")
-        for index, (user_id, nickname, count) in enumerate(rows[:TOP_LIMIT], start=1):
-            prefix = medals[index - 1] if index <= len(medals) else f"{index:>2}."
-            lines.append(f"{prefix} {nickname}（{user_id}） × {count} 🐵")
-        if len(rows) > TOP_LIMIT:
-            lines.append(f"另有 {len(rows) - TOP_LIMIT} 人未展示")
+        filtered_rows = [row for row in rows if row[0] != 3862467831]
+        if not filtered_rows:
+            lines.append("今天还没有人收到 🐵 表情。")
+        else:
+            for index, (_user_id, nickname, count) in enumerate(
+                filtered_rows[:TOP_LIMIT], start=1
+            ):
+                prefix = medals[index - 1] if index <= len(medals) else f"{index:>2}."
+                lines.append(f"{prefix} {nickname} × {count} 🐵")
+            if len(filtered_rows) > TOP_LIMIT:
+                lines.append(f"另有 {len(filtered_rows) - TOP_LIMIT} 人未展示")
     lines.append("━━━━━━━━━━━━")
     if refresh_failures:
         lines.append(f"⚠️ {refresh_failures} 条消息的回应读取失败，结果可能不完整")
