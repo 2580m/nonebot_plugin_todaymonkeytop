@@ -15,14 +15,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import nonebot
 from nonebot import logger, on_command, on_message, on_notice, require
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
+from nonebot.permission import SUPERUSER
 from nonebot.rule import is_type
 from sqlalchemy import delete, func, select
 
@@ -256,6 +259,82 @@ class MonkeyStore:
                 await session.execute(
                     delete(MonkeyDailyReport).where(MonkeyDailyReport.day < cutoff)
                 )
+
+    @staticmethod
+    def _whitelist_path() -> Path:
+        """返回白名单 JSON 文件的路径（按需创建父目录）。"""
+        try:
+            base = Path(nonebot.get_driver().config.data_dir)
+        except (AttributeError, KeyError, RuntimeError):
+            base = Path("data")
+        path = base / "nonebot_plugin_todaymonkeytop"
+        path.mkdir(parents=True, exist_ok=True)
+        return path / "push_list.json"
+
+    @staticmethod
+    def _load_whitelist() -> list[dict[str, Any]]:
+        """从 JSON 文件读取白名单列表。"""
+        wl_path = MonkeyStore._whitelist_path()
+        if not wl_path.exists():
+            return []
+        try:
+            raw = wl_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return data
+            return []
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    @staticmethod
+    def _save_whitelist(data: list[dict[str, Any]]) -> None:
+        """将白名单列表写入 JSON 文件。"""
+        wl_path = MonkeyStore._whitelist_path()
+        wl_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    async def is_group_whitelisted(self, bot_id: str, group_id: int) -> bool:
+        """检查群是否在白名单中。"""
+        async with self.lock:
+            return any(
+                item["bot_id"] == bot_id and item["group_id"] == group_id
+                for item in MonkeyStore._load_whitelist()
+            )
+
+    async def add_to_whitelist(self, bot_id: str, group_id: int) -> None:
+        """将群加入推送白名单（幂等）。"""
+        async with self.lock:
+            data = MonkeyStore._load_whitelist()
+            if not any(
+                item["bot_id"] == bot_id and item["group_id"] == group_id
+                for item in data
+            ):
+                data.append({"bot_id": bot_id, "group_id": group_id})
+                MonkeyStore._save_whitelist(data)
+
+    async def remove_from_whitelist(self, bot_id: str, group_id: int) -> None:
+        """将群移出推送白名单（幂等）。"""
+        async with self.lock:
+            data = MonkeyStore._load_whitelist()
+            new_data = [
+                item
+                for item in data
+                if not (item["bot_id"] == bot_id and item["group_id"] == group_id)
+            ]
+            if len(new_data) != len(data):
+                MonkeyStore._save_whitelist(new_data)
+
+    async def list_whitelist(self) -> list[tuple[str, int]]:
+        """列出所有在白名单中的群组（按 bot_id, group_id 排序）。"""
+        async with self.lock:
+            items = [
+                (item["bot_id"], item["group_id"])
+                for item in MonkeyStore._load_whitelist()
+            ]
+            items.sort(key=lambda x: (x[0], x[1]))
+            return items
 
 
 store = MonkeyStore()
@@ -521,6 +600,142 @@ async def _show_current_ranking(bot: Bot, event: GroupMessageEvent) -> None:
     await rank_query.finish(_render_ranking(rows, day=day, refresh_failures=failures))
 
 
+def _get_target_group_id(event: Event, args_text: str) -> int | None:
+    """从命令参数或事件中解析目标群号。"""
+    import re
+
+    # 尝试从参数中提取群号
+    match = re.search(r"\d+", args_text)
+    if match:
+        try:
+            return int(match.group())
+        except (ValueError, OverflowError):
+            return None
+    # 无参数时使用当前群（仅群消息有效）
+    if hasattr(event, "group_id"):
+        return int(event.group_id)  # type: ignore[union-attr]
+    return None
+
+
+enable_push = on_command(
+    "开启贴猴统计推送", permission=SUPERUSER, priority=10, block=True
+)
+
+
+@enable_push.handle()
+async def _enable_push(bot: Bot, event: Event) -> None:
+    """将群加入推送白名单（SUPERUSER）。"""
+    raw_text = str(event.get_message()).strip()
+    parts = raw_text.split(maxsplit=1)
+    args_text = parts[1].strip() if len(parts) > 1 else ""
+    target_group = _get_target_group_id(event, args_text)
+    if target_group is None:
+        await enable_push.finish("❌ 请在群聊中使用，或在命令后指定群号")
+
+    await store.add_to_whitelist(str(bot.self_id), target_group)
+    logger.info(
+        "todaymonkeytop: 已添加推送白名单 gid={} bot={}", target_group, bot.self_id
+    )
+    await enable_push.finish(f"✅ 已开启群 {target_group} 的每日贴猴统计推送")
+
+
+list_push = on_command(
+    "列出贴猴统计推送", permission=SUPERUSER, priority=10, block=True
+)
+
+
+@list_push.handle()
+async def _list_push(bot: Bot, event: Event) -> None:
+    """列出所有推送白名单群组（SUPERUSER）。"""
+    rows = await store.list_whitelist()
+    now_text = _now().strftime("%H:%M")
+    if not rows:
+        await list_push.finish("📋 当前没有开启贴猴统计推送的群")
+    lines = ["📋 贴猴统计推送白名单", f"（截至 {now_text}）", "━━━━━━━━━━━━"]
+    for bot_id, group_id in rows:
+        lines.append(f"• 群 {group_id}（Bot: {bot_id}）")
+    lines.append(f"共 {len(rows)} 个群")
+    await list_push.finish("\n".join(lines))
+
+
+disable_push = on_command(
+    "关闭贴猴统计推送", permission=SUPERUSER, priority=10, block=True
+)
+
+
+@disable_push.handle()
+async def _disable_push(bot: Bot, event: Event) -> None:
+    """将群移出推送白名单（SUPERUSER）。"""
+    raw_text = str(event.get_message()).strip()
+    parts = raw_text.split(maxsplit=1)
+    args_text = parts[1].strip() if len(parts) > 1 else ""
+    target_group = _get_target_group_id(event, args_text)
+    if target_group is None:
+        await disable_push.finish("❌ 请在群聊中使用，或在命令后指定群号")
+
+    await store.remove_from_whitelist(str(bot.self_id), target_group)
+    logger.info(
+        "todaymonkeytop: 已移除推送白名单 gid={} bot={}", target_group, bot.self_id
+    )
+    await disable_push.finish(f"✅ 已关闭群 {target_group} 的每日贴猴统计推送")
+
+
+test_push = on_command(
+    "测试贴猴统计推送", permission=SUPERUSER, priority=10, block=True
+)
+
+
+@test_push.handle()
+async def _test_push(bot: Bot, event: Event) -> None:
+    """测试指定群的每日推送是否正常（SUPERUSER）。"""
+    raw_text = str(event.get_message()).strip()
+    parts = raw_text.split(maxsplit=1)
+    args_text = parts[1].strip() if len(parts) > 1 else ""
+    target_group = _get_target_group_id(event, args_text)
+    if target_group is None:
+        await test_push.finish("❌ 请在群聊中使用，或在命令后指定群号")
+
+    day = _today()
+    bot_id = str(bot.self_id)
+
+    # 1. 检查是否有消息记录
+    owners = await store.messages_for_group(day, bot_id, target_group)
+    if not owners:
+        await test_push.finish(
+            f"⚠️ 群 {target_group} 今天没有消息记录，无法测试推送"
+        )
+
+    # 2. 检查白名单
+    whitelisted = await store.is_group_whitelisted(bot_id, target_group)
+    if not whitelisted:
+        await test_push.finish(
+            f"❌ 群 {target_group} 未开启白名单，每日 23:59 不会收到自动推送。\n"
+            f"请使用「开启贴猴统计推送」加入白名单"
+        )
+
+    # 3. 刷新并发送测试推送
+    await test_push.send(
+        f"🔄 正在刷新群 {target_group} 的猴榜数据并发送测试推送…"
+    )
+    _, failures = await _refresh_group(bot, target_group, day)
+    rows = await store.ranking(day, bot_id, target_group)
+    message = _render_ranking(rows, day=day, refresh_failures=failures)
+    await bot.send_group_msg(group_id=target_group, message=message)
+
+    logger.info(
+        "todaymonkeytop: 测试推送成功 gid={} bot={} entries={}",
+        target_group,
+        bot_id,
+        len(rows),
+    )
+    status = "⚠️ 部分消息刷新失败" if failures else "✅ 全部刷新成功"
+    await test_push.finish(
+        f"✅ 测试推送完成！\n"
+        f"• 群 {target_group} 已收到今日猴榜（{len(rows)} 人上榜）\n"
+        f"• {status}"
+    )
+
+
 @scheduler.scheduled_job(
     "cron",
     hour=23,
@@ -543,6 +758,12 @@ async def _send_daily_rankings() -> None:
         if await store.report_already_sent(day, bot_id, group_id):
             logger.info(
                 "todaymonkeytop: 今日榜单已发送，跳过 gid={} bot={}", group_id, bot_id
+            )
+            continue
+        if not await store.is_group_whitelisted(bot_id, group_id):
+            logger.info(
+                "todaymonkeytop: 群 {} 未在白名单，跳过每日推送",
+                group_id,
             )
             continue
         raw_bot = bots.get(bot_id)
