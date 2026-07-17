@@ -2,3 +2,5 @@ log.txt
 __pycache__/
 *.egg-info/
 .pytest_cache/
+.orm_check_env
+orm_check.sqlite3
