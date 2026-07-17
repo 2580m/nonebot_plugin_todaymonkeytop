@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 from zoneinfo import ZoneInfo
 
 import nonebot
@@ -42,6 +43,77 @@ PLUGIN_NAME = "今日猴榜"
 MONKEY_EMOJI_ID = "128053"
 TOP_LIMIT = 10
 TIME_ZONE = ZoneInfo("Asia/Shanghai")
+
+
+class _PluginLogger:
+    """写入文件 ``data/nonebot_plugin_todaymonkeytop/log.txt`` 的插件专用日志器。
+
+    - 运行时追加写入；调用 ``refresh()`` 后截断文件，仅保留本次调用的日志。
+    - 所有等级的方法签名与 NoneBot logger 一致，可无缝替换。
+    """
+
+    def __init__(self) -> None:
+        self._file: TextIO | None = None
+        self._path: Path | None = None
+
+    @property
+    def _log_path(self) -> Path:
+        if self._path is None:
+            try:
+                base = Path(nonebot.get_driver().config.data_dir)
+            except (AttributeError, KeyError, RuntimeError):
+                base = Path("data")
+            path = base / "nonebot_plugin_todaymonkeytop"
+            path.mkdir(parents=True, exist_ok=True)
+            self._path = path / "log.txt"
+        return self._path
+
+    def _open(self, mode: str = "a") -> None:
+        if self._file is not None and not self._file.closed:
+            self._file.close()
+        self._file = open(self._log_path, mode, encoding="utf-8")
+
+    def refresh(self) -> None:
+        """截断日志文件，开始记录新一次调用的日志。"""
+        self._open("w")
+
+    def _write(self, level: str, msg: str, args: tuple[Any, ...] = ()) -> None:
+        if self._file is None or self._file.closed:
+            self._open("a")
+        ts = _now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            text = msg.format(*args) if args else msg
+        except (KeyError, IndexError):
+            text = msg
+        line = f"[{ts}] [{level}] {text}\n"
+        try:
+            self._file.write(line)
+            self._file.flush()
+        except OSError:
+            pass  # 文件不可写时静默忽略
+
+    def info(self, msg: str, *args: Any) -> None:
+        self._write("INFO", msg, args)
+
+    def warning(self, msg: str, *args: Any) -> None:
+        self._write("WARNING", msg, args)
+
+    def error(self, msg: str, *args: Any) -> None:
+        self._write("ERROR", msg, args)
+
+    def exception(self, msg: str, *args: Any) -> None:
+        self._write("ERROR", msg, args)
+        tb_text = traceback.format_exc()
+        if tb_text and tb_text.strip() not in ("", "NoneType: None"):
+            for tb_line in tb_text.rstrip().split("\n"):
+                self._write("ERROR", tb_line)
+
+    def debug(self, msg: str, *args: Any) -> None:
+        self._write("DEBUG", msg, args)
+
+
+# 替换 NoneBot logger，所有插件日志写入文件而非控制台
+logger = _PluginLogger()  # noqa: F811 — 有意覆盖 import 的 logger
 
 
 def _now() -> datetime:
@@ -587,6 +659,7 @@ rank_query = on_command(
 
 @rank_query.handle()
 async def _show_current_ranking(bot: Bot, event: GroupMessageEvent) -> None:
+    logger.refresh()
     day = _today()
     logger.info(
         "todaymonkeytop: 收到榜单查询 gid={} requester={} day={}",
@@ -688,6 +761,7 @@ test_push = on_command(
 @test_push.handle()
 async def _test_push(bot: Bot, event: Event) -> None:
     """测试指定群的每日推送是否正常（SUPERUSER）。"""
+    logger.refresh()
     raw_text = str(event.get_message()).strip()
     parts = raw_text.split(maxsplit=1)
     args_text = parts[1].strip() if len(parts) > 1 else ""
@@ -745,6 +819,7 @@ async def _test_push(bot: Bot, event: Event) -> None:
 )
 async def _send_daily_rankings() -> None:
     """在每天 23:59 向当天有记录消息的群发送榜单。"""
+    logger.refresh()
     day = _today()
     groups = await store.groups_for_day(day)
     bots = nonebot.get_bots()
