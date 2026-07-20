@@ -358,33 +358,26 @@ class MonkeyStore:
                     )
 
     async def prune_previous_year(self) -> None:
-        """删除去年全年的排行数据（每年 1 月 1 日 12:00 调用一次）。"""
+        """删除去年及更早的排行数据（每年 1 月 1 日 12:00 和启动时调用）。
+
+        使用 ``day < cutoff`` 替代区间查询：若某年 1 月 1 日 bot 不在线，
+        下一次运行时自动追补清理所有过期年份。"""
         year = _now().year - 1
-        start = f"{year}-01-01"
-        end = f"{year}-12-31"
+        cutoff = f"{year + 1}-01-01"
         async with self.lock:
             session = get_session()
             async with session.begin():
                 await session.execute(
-                    delete(MonkeyReaction).where(
-                        MonkeyReaction.day >= start,
-                        MonkeyReaction.day <= end,
-                    )
+                    delete(MonkeyReaction).where(MonkeyReaction.day < cutoff)
                 )
                 await session.execute(
-                    delete(MonkeyMessage).where(
-                        MonkeyMessage.day >= start,
-                        MonkeyMessage.day <= end,
-                    )
+                    delete(MonkeyMessage).where(MonkeyMessage.day < cutoff)
                 )
                 await session.execute(
-                    delete(MonkeyDailyReport).where(
-                        MonkeyDailyReport.day >= start,
-                        MonkeyDailyReport.day <= end,
-                    )
+                    delete(MonkeyDailyReport).where(MonkeyDailyReport.day < cutoff)
                 )
                 logger.info(
-                    "todaymonkeytop: 已清理 {} 年数据", year
+                    "todaymonkeytop: 已清理 {} 年及之前的数据", year
                 )
 
     @staticmethod
@@ -874,4 +867,14 @@ async def _send_daily_rankings() -> None:
 async def _yearly_prune() -> None:
     """在每年 1 月 1 日 12:00 清理去年全年的排行数据。"""
     logger.refresh()
+    await store.prune_previous_year()
+
+
+@scheduler.scheduled_job(
+    "date",
+    run_date=datetime.now(TIME_ZONE),
+    id="nonebot_plugin_todaymonkeytop_startup_prune",
+)
+async def _startup_prune() -> None:
+    """启动时追补遗漏的年度数据清理。"""
     await store.prune_previous_year()
