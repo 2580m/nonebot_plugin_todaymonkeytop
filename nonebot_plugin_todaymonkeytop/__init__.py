@@ -18,7 +18,7 @@ import asyncio
 import json
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 from zoneinfo import ZoneInfo
@@ -286,6 +286,45 @@ class MonkeyStore:
                     for row in rows
                 ]
 
+    async def yearly_ranking(
+        self, year: str, bot_id: str, group_id: int
+    ) -> list[tuple[int, str, int]]:
+        """查询本年度的贴猴排行，不限人数。"""
+        start = f"{year}-01-01"
+        end = f"{year}-12-31"
+        async with self.lock:
+            session = get_session()
+            async with session.begin():
+                total = func.sum(MonkeyReaction.reaction_count)
+                statement = (
+                    select(
+                        MonkeyMessage.user_id,
+                        func.max(MonkeyMessage.nickname).label("nickname"),
+                        total.label("reaction_count"),
+                    )
+                    .join(
+                        MonkeyReaction,
+                        (MonkeyReaction.bot_id == MonkeyMessage.bot_id)
+                        & (MonkeyReaction.group_id == MonkeyMessage.group_id)
+                        & (MonkeyReaction.message_id == MonkeyMessage.message_id),
+                    )
+                    .where(
+                        MonkeyMessage.day >= start,
+                        MonkeyMessage.day <= end,
+                        MonkeyMessage.bot_id == bot_id,
+                        MonkeyMessage.group_id == group_id,
+                        MonkeyReaction.emoji_id == MONKEY_EMOJI_ID,
+                    )
+                    .group_by(MonkeyMessage.user_id)
+                    .having(total > 0)
+                    .order_by(total.desc(), MonkeyMessage.user_id.asc())
+                )
+                rows = (await session.execute(statement)).all()
+                return [
+                    (int(row.user_id), str(row.nickname), int(row.reaction_count))
+                    for row in rows
+                ]
+
     async def groups_for_day(self, day: str) -> list[tuple[str, int]]:
         async with self.lock:
             session = get_session()
@@ -318,18 +357,34 @@ class MonkeyStore:
                         MonkeyDailyReport(day=day, bot_id=bot_id, group_id=group_id)
                     )
 
-    async def prune(self, keep_days: int = 14) -> None:
-        """删除过期的 SQLite 排行数据。"""
-        cutoff = (_now().date() - timedelta(days=keep_days)).isoformat()
+    async def prune_previous_year(self) -> None:
+        """删除去年全年的排行数据（每年 1 月 1 日 12:00 调用一次）。"""
+        year = _now().year - 1
+        start = f"{year}-01-01"
+        end = f"{year}-12-31"
         async with self.lock:
             session = get_session()
             async with session.begin():
                 await session.execute(
-                    delete(MonkeyReaction).where(MonkeyReaction.day < cutoff)
+                    delete(MonkeyReaction).where(
+                        MonkeyReaction.day >= start,
+                        MonkeyReaction.day <= end,
+                    )
                 )
-                await session.execute(delete(MonkeyMessage).where(MonkeyMessage.day < cutoff))
                 await session.execute(
-                    delete(MonkeyDailyReport).where(MonkeyDailyReport.day < cutoff)
+                    delete(MonkeyMessage).where(
+                        MonkeyMessage.day >= start,
+                        MonkeyMessage.day <= end,
+                    )
+                )
+                await session.execute(
+                    delete(MonkeyDailyReport).where(
+                        MonkeyDailyReport.day >= start,
+                        MonkeyDailyReport.day <= end,
+                    )
+                )
+                logger.info(
+                    "todaymonkeytop: 已清理 {} 年数据 year={}", year, year
                 )
 
     @staticmethod
@@ -432,6 +487,25 @@ def _render_ranking(rows: list[tuple[int, str, int]], *, day: str) -> str:
             if len(filtered_rows) > TOP_LIMIT:
                 lines.append(f"另有 {len(filtered_rows) - TOP_LIMIT} 人未展示")
     lines.append("━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+def _render_yearly_ranking(rows: list[tuple[int, str, int]], *, year: str) -> str:
+    """渲染年度猴榜，不限人数。"""
+    now_text = _now().strftime("%Y-%m-%d %H:%M")
+    lines = ["🐵【年度猴榜】🐵", f"统计年份：{year}年（截至 {now_text}）", "━━━━━━━━━━━━"]
+    filtered_rows = [row for row in rows if row[0] != 3862467831]
+    if not filtered_rows:
+        lines.append(f"{year}年还没有人收到 🐵 表情。")
+    else:
+        medals = ("🥇", "🥈", "🥉")
+        for index, (_user_id, nickname, count) in enumerate(
+            filtered_rows, start=1
+        ):
+            prefix = medals[index - 1] if index <= len(medals) else f"{index:>2}."
+            lines.append(f"{prefix} {nickname} × {count} 🐵")
+    lines.append("━━━━━━━━━━━━")
+    lines.append(f"共 {len(filtered_rows)} 人上榜")
     return "\n".join(lines)
 
 
@@ -575,6 +649,26 @@ async def _show_current_ranking(bot: Bot, event: GroupMessageEvent) -> None:
     )
     rows = await store.ranking(day, str(bot.self_id), event.group_id)
     await rank_query.finish(_render_ranking(rows, day=day))
+
+
+year_rank_query = on_command(
+    "年度猴榜", rule=is_type(GroupMessageEvent), priority=10, block=True
+)
+
+
+@year_rank_query.handle()
+async def _show_yearly_ranking(bot: Bot, event: GroupMessageEvent) -> None:
+    """查看本年度的贴猴排行，不限人数。"""
+    logger.refresh()
+    year = str(_now().year)
+    logger.info(
+        "todaymonkeytop: 收到年度榜查询 gid={} requester={} year={}",
+        event.group_id,
+        event.user_id,
+        year,
+    )
+    rows = await store.yearly_ranking(year, str(bot.self_id), event.group_id)
+    await year_rank_query.finish(_render_yearly_ranking(rows, year=year))
 
 
 def _get_target_group_id(event: Event, args_text: str) -> int | None:
@@ -765,5 +859,19 @@ async def _send_daily_rankings() -> None:
             logger.exception(
                 "todaymonkeytop: 每日榜单发送失败 gid={} bot={}", group_id, bot_id
             )
-    await store.prune()
     logger.info("todaymonkeytop: 每日结算完成 day={}", day)
+
+
+@scheduler.scheduled_job(
+    "cron",
+    month=1,
+    day=1,
+    hour=12,
+    minute=0,
+    timezone="Asia/Shanghai",
+    id="nonebot_plugin_todaymonkeytop_yearly_prune",
+)
+async def _yearly_prune() -> None:
+    """在每年 1 月 1 日 12:00 清理去年全年的排行数据。"""
+    logger.refresh()
+    await store.prune_previous_year()
