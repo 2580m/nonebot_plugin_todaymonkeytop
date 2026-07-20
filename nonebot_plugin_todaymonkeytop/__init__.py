@@ -384,7 +384,7 @@ class MonkeyStore:
                     )
                 )
                 logger.info(
-                    "todaymonkeytop: 已清理 {} 年数据 year={}", year, year
+                    "todaymonkeytop: 已清理 {} 年数据", year
                 )
 
     @staticmethod
@@ -797,7 +797,7 @@ async def _test_push(bot: Bot, event: Event) -> None:
         bot_id,
         len(rows),
     )
-    status = "⚠️ 部分消息刷新失败" if failures else "✅ 全部刷新成功"
+    status = "✅ 测试推送不涉及 API 刷新，结果来自本地快照"
     await test_push.finish(
         f"✅ 测试推送完成！\n"
         f"• 群 {target_group} 已收到今日猴榜（{len(rows)} 人上榜）\n"
