@@ -357,6 +357,17 @@ class MonkeyStore:
                         MonkeyDailyReport(day=day, bot_id=bot_id, group_id=group_id)
                     )
 
+    async def clear_report_sent(self, day: str, bot_id: str, group_id: int) -> None:
+        """清除指定群的日榜发送记录，允许当天再次发送。"""
+        async with self.lock:
+            session = get_session()
+            async with session.begin():
+                record = await session.get(
+                    MonkeyDailyReport, (day, bot_id, group_id)
+                )
+                if record is not None:
+                    await session.delete(record)
+
     async def prune_previous_year(self) -> None:
         """删除去年及更早的排行数据（每年 1 月 1 日 12:00 和启动时调用）。
 
@@ -742,6 +753,32 @@ async def _disable_push(bot: Bot, event: Event) -> None:
         "todaymonkeytop: 已移除推送白名单 gid={} bot={}", target_group, bot.self_id
     )
     await disable_push.finish(f"✅ 已关闭群 {target_group} 的每日贴猴统计推送")
+
+
+clear_report = on_command(
+    "clear_report_sent_recode", permission=SUPERUSER, priority=10, block=True
+)
+
+
+@clear_report.handle()
+async def _clear_report_sent(bot: Bot, event: Event) -> None:
+    """清除本群今天的日榜发送记录，到达发送时间时再次推送（SUPERUSER）。"""
+    raw_text = str(event.get_message()).strip()
+    parts = raw_text.split(maxsplit=1)
+    args_text = parts[1].strip() if len(parts) > 1 else ""
+    target_group = _get_target_group_id(event, args_text)
+    if target_group is None:
+        await clear_report.finish("❌ 请在群聊中使用，或在命令后指定群号")
+
+    day = _today()
+    await store.clear_report_sent(day, str(bot.self_id), target_group)
+    logger.info(
+        "todaymonkeytop: 已清除发送记录 gid={} day={}", target_group, day
+    )
+    await clear_report.finish(
+        f"✅ 已清除群 {target_group} 今天（{day}）的日榜发送记录，"
+        f"将在下次发送时间重新推送"
+    )
 
 
 test_push = on_command(
