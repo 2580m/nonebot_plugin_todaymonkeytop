@@ -202,6 +202,7 @@ class MonkeyStore:
     async def messages_for_group(
         self, day: str, bot_id: str, group_id: int
     ) -> list[MessageOwner]:
+        bot_ids = await self.resolve_bot_ids(bot_id)
         async with self.lock:
             session = get_session()
             async with session.begin():
@@ -209,7 +210,7 @@ class MonkeyStore:
                     select(MonkeyMessage)
                     .where(
                         MonkeyMessage.day == day,
-                        MonkeyMessage.bot_id == bot_id,
+                        MonkeyMessage.bot_id.in_(bot_ids),
                         MonkeyMessage.group_id == group_id,
                     )
                     .order_by(MonkeyMessage.message_time, MonkeyMessage.message_id)
@@ -254,6 +255,7 @@ class MonkeyStore:
     async def ranking(
         self, day: str, bot_id: str, group_id: int
     ) -> list[tuple[int, str, int]]:
+        bot_ids = await self.resolve_bot_ids(bot_id)
         async with self.lock:
             session = get_session()
             async with session.begin():
@@ -272,7 +274,7 @@ class MonkeyStore:
                     )
                     .where(
                         MonkeyMessage.day == day,
-                        MonkeyMessage.bot_id == bot_id,
+                        MonkeyMessage.bot_id.in_(bot_ids),
                         MonkeyMessage.group_id == group_id,
                         MonkeyReaction.emoji_id == MONKEY_EMOJI_ID,
                     )
@@ -290,6 +292,7 @@ class MonkeyStore:
         self, year: str, bot_id: str, group_id: int
     ) -> list[tuple[int, str, int]]:
         """查询本年度的贴猴排行，不限人数。"""
+        bot_ids = await self.resolve_bot_ids(bot_id)
         start = f"{year}-01-01"
         end = f"{year}-12-31"
         async with self.lock:
@@ -311,7 +314,7 @@ class MonkeyStore:
                     .where(
                         MonkeyMessage.day >= start,
                         MonkeyMessage.day <= end,
-                        MonkeyMessage.bot_id == bot_id,
+                        MonkeyMessage.bot_id.in_(bot_ids),
                         MonkeyMessage.group_id == group_id,
                         MonkeyReaction.emoji_id == MONKEY_EMOJI_ID,
                     )
@@ -466,6 +469,65 @@ class MonkeyStore:
             ]
             items.sort(key=lambda x: (x[0], x[1]))
             return items
+
+    @staticmethod
+    def _bot_groups_path() -> Path:
+        """返回 bot 身份组 JSON 文件的路径（按需创建父目录）。"""
+        try:
+            base = Path(nonebot.get_driver().config.data_dir)
+        except (AttributeError, KeyError, RuntimeError):
+            base = Path("data")
+        path = base / "nonebot_plugin_todaymonkeytop"
+        path.mkdir(parents=True, exist_ok=True)
+        return path / "bot_id_groups.json"
+
+    @staticmethod
+    def _load_bot_groups() -> list[list[str]]:
+        """从 JSON 文件读取 bot 身份组列表。"""
+        bg_path = MonkeyStore._bot_groups_path()
+        if not bg_path.exists():
+            return []
+        try:
+            raw = bg_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [
+                    [str(item) for item in group if isinstance(item, (str, int))]
+                    for group in data
+                    if isinstance(group, list)
+                ]
+            return []
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    @staticmethod
+    def _save_bot_groups(groups: list[list[str]]) -> None:
+        """将 bot 身份组列表写入 JSON 文件。"""
+        bg_path = MonkeyStore._bot_groups_path()
+        bg_path.write_text(
+            json.dumps(groups, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    async def set_bot_group(self, ids: list[str]) -> None:
+        """将给定 bot id 注册为同一身份组（替换旧组，幂等去重）。"""
+        deduped = list(dict.fromkeys(ids))
+        async with self.lock:
+            groups = MonkeyStore._load_bot_groups()
+            groups = [
+                group
+                for group in groups
+                if not any(member in group for member in deduped)
+            ]
+            groups.append(deduped)
+            MonkeyStore._save_bot_groups(groups)
+
+    async def resolve_bot_ids(self, bot_id: str) -> list[str]:
+        """返回与 bot_id 同身份组的全部 id（含自身）；未注册时返回 [bot_id]。"""
+        for group in MonkeyStore._load_bot_groups():
+            if bot_id in group:
+                return group
+        return [bot_id]
 
 
 store = MonkeyStore()
@@ -778,6 +840,41 @@ async def _clear_report_sent(bot: Bot, event: Event) -> None:
     await clear_report.finish(
         f"✅ 已清除群 {target_group} 今天（{day}）的日榜发送记录，"
         f"将在下次发送时间重新推送"
+    )
+
+
+bot_group_cmd = on_command(
+    "todaymonkey_bot_id_group", permission=SUPERUSER, priority=10, block=True
+)
+
+
+@bot_group_cmd.handle()
+async def _set_bot_id_group(bot: Bot, event: Event) -> None:
+    """将数个 bot id 注册为同一身份组，查询时合并数据（SUPERUSER）。"""
+    import re
+
+    raw_text = str(event.get_message()).strip()
+    parts = raw_text.split(maxsplit=1)
+    args_text = parts[1].strip() if len(parts) > 1 else ""
+    ids = list(dict.fromkeys(re.findall(r"\d+", args_text)))
+    if not ids:
+        await bot_group_cmd.finish(
+            "❌ 用法：todaymonkey_bot_id_group <id1> <id2> ..."
+        )
+    if str(bot.self_id) not in ids:
+        await bot_group_cmd.finish(
+            f"❌ 当前机器人 {bot.self_id} 必须在列表中"
+        )
+
+    await store.set_bot_group(ids)
+    logger.info(
+        "todaymonkeytop: 已设置 bot 身份组 ids={} operator={}",
+        ids,
+        event.user_id,
+    )
+    await bot_group_cmd.finish(
+        f"✅ 已将 {'、'.join(ids)} 合并为同一 bot 身份，"
+        f"日榜/年榜查询将合并这些 bot 的数据"
     )
 
 
