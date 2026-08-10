@@ -17,6 +17,7 @@ class MonkeyMessage(Model):
     """当天被统计的群消息及其发送者。"""
 
     __tablename__ = "nonebot_plugin_todaymonkeytop_messages"
+    __bind_key__ = "nonebot_plugin_todaymonkeytop"
     __table_args__ = (
         Index(
             "ix_todaymonkeytop_messages_day_bot_group",
@@ -40,6 +41,7 @@ class MonkeyReaction(Model):
     """一条消息在某个表情下的当前回应人数快照。"""
 
     __tablename__ = "nonebot_plugin_todaymonkeytop_reactions"
+    __bind_key__ = "nonebot_plugin_todaymonkeytop"
     __table_args__ = (
         Index(
             "ix_todaymonkeytop_reactions_day_bot_group",
@@ -64,6 +66,7 @@ class MonkeyDailyReport(Model):
     """已成功发送过的日榜，防止同一天重复发送。"""
 
     __tablename__ = "nonebot_plugin_todaymonkeytop_daily_reports"
+    __bind_key__ = "nonebot_plugin_todaymonkeytop"
 
     day: Mapped[str] = mapped_column(String(10), primary_key=True)
     bot_id: Mapped[str] = mapped_column(String(32), primary_key=True)
