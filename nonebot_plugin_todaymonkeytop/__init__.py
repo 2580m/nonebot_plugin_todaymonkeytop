@@ -710,9 +710,8 @@ async def _toggle_coop_mode(bot: Bot, event: GroupMessageEvent) -> None:
             event.user_id,
             event.group_id,
         )
-        await coop_mode_switch.finish(
-            "🔇 协程模式已开启：插件仅记录数据，不响应任何命令"
-        )
+        # 开启后完全静默：不回复任何确认消息
+        await coop_mode_switch.stop()
     elif verb in ("关", "关闭"):
         await store.set_coop_mode(False)
         logger.info(
@@ -800,11 +799,9 @@ rank_query = on_command(
 
 
 async def _coop_mode_gate(matcher: Any, command_name: str) -> bool:
-    """协程模式开启时，命令直接回复提示并终止，返回 True 表示已拦截。"""
+    """协程模式开启时静默拦截命令（不发送任何消息），返回 True 表示已拦截。"""
     if await store.is_coop_mode_enabled():
-        await matcher.finish(
-            f"🔇 协程模式已开启，插件仅记录数据，不响应「{command_name}」命令"
-        )
+        await matcher.stop()
         return True
     return False
 
