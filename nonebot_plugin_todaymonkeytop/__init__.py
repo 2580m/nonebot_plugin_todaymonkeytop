@@ -28,7 +28,7 @@ from nonebot import logger, on_command, on_message, on_notice, require
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
 from nonebot.permission import SUPERUSER
 from nonebot.rule import is_type
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 
 # NoneBot 没有内置定时器；该插件是发布每日榜单所必需的依赖。
 require("nonebot_plugin_apscheduler")
@@ -1012,3 +1012,19 @@ async def _yearly_prune() -> None:
 async def _startup_prune() -> None:
     """启动时追补遗漏的年度数据清理。"""
     await store.prune_previous_year()
+
+
+@nonebot.get_driver().on_startup
+async def _enable_shared_sqlite_wal() -> None:
+    """为共享 SQLite 数据库开启 WAL 模式，支持多机器人实例并发读写。
+
+    仅在 SQLite 后端生效；PostgreSQL/MySQL 会静默跳过。
+    """
+    try:
+        session = get_session()
+        async with session.begin():
+            await session.execute(text("PRAGMA journal_mode=WAL"))
+            await session.execute(text("PRAGMA busy_timeout=30000"))
+        logger.info("todaymonkeytop: 已开启 SQLite WAL 模式（共享库多实例并发）")
+    except Exception:
+        logger.exception("todaymonkeytop: 开启 SQLite WAL 模式失败（非 SQLite 后端可忽略）")
