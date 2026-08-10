@@ -529,6 +529,49 @@ class MonkeyStore:
                 return group
         return [bot_id]
 
+    @staticmethod
+    def _mode_path() -> Path:
+        """返回协程模式状态 JSON 文件的路径（按需创建父目录）。"""
+        try:
+            base = Path(nonebot.get_driver().config.data_dir)
+        except (AttributeError, KeyError, RuntimeError):
+            base = Path("data")
+        path = base / "nonebot_plugin_todaymonkeytop"
+        path.mkdir(parents=True, exist_ok=True)
+        return path / "mode.json"
+
+    @staticmethod
+    def _load_mode() -> bool:
+        """从 JSON 文件读取协程模式状态（默认关闭）。"""
+        mode_path = MonkeyStore._mode_path()
+        if not mode_path.exists():
+            return False
+        try:
+            raw = mode_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            return bool(data.get("enabled", False))
+        except (json.JSONDecodeError, OSError, AttributeError):
+            return False
+
+    @staticmethod
+    def _save_mode(enabled: bool) -> None:
+        """将协程模式状态写入 JSON 文件。"""
+        mode_path = MonkeyStore._mode_path()
+        mode_path.write_text(
+            json.dumps({"enabled": enabled}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    async def is_coop_mode_enabled(self) -> bool:
+        """协程模式是否开启（开启时插件只记录数据、不响应命令）。"""
+        async with self.lock:
+            return MonkeyStore._load_mode()
+
+    async def set_coop_mode(self, enabled: bool) -> None:
+        """设置协程模式开关。"""
+        async with self.lock:
+            MonkeyStore._save_mode(enabled)
+
 
 store = MonkeyStore()
 
@@ -632,6 +675,59 @@ async def _track_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     )
 
 
+# 协程模式：@机器人 发送「协程模式开 / 协程模式关」（SUPERUSER）切换。
+# 开启后插件只写数据库，不响应任何命令。
+coop_mode_switch = on_message(
+    rule=is_type(GroupMessageEvent), priority=5, block=False
+)
+
+
+@coop_mode_switch.handle()
+async def _toggle_coop_mode(bot: Bot, event: GroupMessageEvent) -> None:
+    import re
+
+    raw = event.raw_message
+    # 必须 @ 到当前机器人
+    if f"[CQ:at,qq={bot.self_id}]" not in raw:
+        return
+    text = raw.replace(f"[CQ:at,qq={bot.self_id}]", "").strip()
+    match = re.search(r"协程模式\s*(开|关|开启|关闭)?", text)
+    if not match:
+        return
+
+    # 仅 SUPERUSER 可切换
+    driver = nonebot.get_driver()
+    superusers = getattr(driver.config, "superusers", set())
+    if str(event.user_id) not in superusers:
+        await coop_mode_switch.finish("❌ 仅 SUPERUSER 可切换协程模式")
+        return
+
+    verb = match.group(1) or ""
+    if verb in ("开", "开启"):
+        await store.set_coop_mode(True)
+        logger.info(
+            "todaymonkeytop: 已开启协程模式 operator={} gid={}",
+            event.user_id,
+            event.group_id,
+        )
+        await coop_mode_switch.finish(
+            "🔇 协程模式已开启：插件仅记录数据，不响应任何命令"
+        )
+    elif verb in ("关", "关闭"):
+        await store.set_coop_mode(False)
+        logger.info(
+            "todaymonkeytop: 已关闭协程模式 operator={} gid={}",
+            event.user_id,
+            event.group_id,
+        )
+        await coop_mode_switch.finish("🔊 协程模式已关闭：恢复正常响应")
+    else:
+        enabled = await store.is_coop_mode_enabled()
+        await coop_mode_switch.finish(
+            f"协程模式当前：{'🔇 已开启（仅记录数据）' if enabled else '🔊 已关闭（正常响应）'}"
+        )
+
+
 # NapCat 的 group_msg_emoji_like 是 OneBot notice 扩展事件；保留为通用事件以
 # 兼容 adapter-onebot 尚未声明该扩展类型的版本。
 emoji_like_listener = on_notice(priority=20, block=False)
@@ -703,8 +799,20 @@ rank_query = on_command(
 )
 
 
+async def _coop_mode_gate(matcher: Any, command_name: str) -> bool:
+    """协程模式开启时，命令直接回复提示并终止，返回 True 表示已拦截。"""
+    if await store.is_coop_mode_enabled():
+        await matcher.finish(
+            f"🔇 协程模式已开启，插件仅记录数据，不响应「{command_name}」命令"
+        )
+        return True
+    return False
+
+
 @rank_query.handle()
 async def _show_current_ranking(bot: Bot, event: GroupMessageEvent) -> None:
+    if await _coop_mode_gate(rank_query, "今日猴榜"):
+        return
     logger.refresh()
     day = _today()
     logger.info(
@@ -725,6 +833,8 @@ year_rank_query = on_command(
 @year_rank_query.handle()
 async def _show_yearly_ranking(bot: Bot, event: GroupMessageEvent) -> None:
     """查看本年度的贴猴排行，不限人数。"""
+    if await _coop_mode_gate(year_rank_query, "年度猴榜"):
+        return
     logger.refresh()
     year = str(_now().year)
     logger.info(
@@ -762,6 +872,8 @@ enable_push = on_command(
 @enable_push.handle()
 async def _enable_push(bot: Bot, event: Event) -> None:
     """将群加入推送白名单（SUPERUSER）。"""
+    if await _coop_mode_gate(enable_push, "开启贴猴统计推送"):
+        return
     raw_text = str(event.get_message()).strip()
     parts = raw_text.split(maxsplit=1)
     args_text = parts[1].strip() if len(parts) > 1 else ""
@@ -784,6 +896,8 @@ list_push = on_command(
 @list_push.handle()
 async def _list_push(bot: Bot, event: Event) -> None:
     """列出所有推送白名单群组（SUPERUSER）。"""
+    if await _coop_mode_gate(list_push, "列出贴猴统计推送"):
+        return
     rows = await store.list_whitelist()
     now_text = _now().strftime("%H:%M")
     if not rows:
@@ -803,6 +917,8 @@ disable_push = on_command(
 @disable_push.handle()
 async def _disable_push(bot: Bot, event: Event) -> None:
     """将群移出推送白名单（SUPERUSER）。"""
+    if await _coop_mode_gate(disable_push, "关闭贴猴统计推送"):
+        return
     raw_text = str(event.get_message()).strip()
     parts = raw_text.split(maxsplit=1)
     args_text = parts[1].strip() if len(parts) > 1 else ""
@@ -825,6 +941,8 @@ clear_report = on_command(
 @clear_report.handle()
 async def _clear_report_sent(bot: Bot, event: Event) -> None:
     """清除本群今天的日榜发送记录，到达发送时间时再次推送（SUPERUSER）。"""
+    if await _coop_mode_gate(clear_report, "clear_report_sent_recode"):
+        return
     raw_text = str(event.get_message()).strip()
     parts = raw_text.split(maxsplit=1)
     args_text = parts[1].strip() if len(parts) > 1 else ""
@@ -853,6 +971,8 @@ async def _set_bot_id_group(bot: Bot, event: Event) -> None:
     """将数个 bot id 注册为同一身份组，查询时合并数据（SUPERUSER）。"""
     import re
 
+    if await _coop_mode_gate(bot_group_cmd, "todaymonkey_bot_id_group"):
+        return
     raw_text = str(event.get_message()).strip()
     parts = raw_text.split(maxsplit=1)
     args_text = parts[1].strip() if len(parts) > 1 else ""
@@ -886,6 +1006,8 @@ test_push = on_command(
 @test_push.handle()
 async def _test_push(bot: Bot, event: Event) -> None:
     """测试指定群的每日推送是否正常（SUPERUSER）。"""
+    if await _coop_mode_gate(test_push, "测试贴猴统计推送"):
+        return
     logger.refresh()
     raw_text = str(event.get_message()).strip()
     parts = raw_text.split(maxsplit=1)

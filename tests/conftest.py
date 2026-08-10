@@ -59,6 +59,23 @@ def _mock_bot_groups_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
 
 
 @pytest.fixture(autouse=True)
+def _mock_mode_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """将协程模式状态读写重定向到临时目录，测试间自动隔离。"""
+    fake_path = tmp_path / "mode.json"
+
+    def mocked_path() -> Path:
+        fake_path.parent.mkdir(parents=True, exist_ok=True)
+        return fake_path
+
+    monkeypatch.setattr(
+        MonkeyStore,
+        "_mode_path",
+        mocked_path,
+    )
+    return fake_path
+
+
+@pytest.fixture(autouse=True)
 def _reset_store_lock():
     """每个测试用例前重置 store 实例锁，避免跨用例异步锁干扰。"""
     store.lock = asyncio.Lock()
