@@ -24,10 +24,11 @@ from typing import Any, TextIO
 from zoneinfo import ZoneInfo
 
 import nonebot
-from nonebot import logger, on_command, on_message, on_notice, require
+from nonebot import get_plugin_config, logger, on_command, on_message, on_notice, require
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
 from nonebot.permission import SUPERUSER
 from nonebot.rule import is_type
+from pydantic import BaseModel
 from sqlalchemy import delete, func, select, text
 
 # NoneBot 没有内置定时器；该插件是发布每日榜单所必需的依赖。
@@ -43,6 +44,22 @@ PLUGIN_NAME = "今日猴榜"
 MONKEY_EMOJI_ID = "128053"
 TOP_LIMIT = 10
 TIME_ZONE = ZoneInfo("Asia/Shanghai")
+
+
+class _PluginConfig(BaseModel):
+    """插件配置。
+
+    todaymonkey_write_delay_seconds:
+        写库延迟秒数。主 bot 不设置（0=立即写）；副 bot 设置为正数
+        （如 30），收到消息/表情事件后延迟指定秒数再写库。配合
+        (group_id, message_id) 去重，主 bot 在线时其记录先落库，
+        副 bot 延迟后查重命中即跳过；主 bot 掉线时副 bot 兜底写入。
+    """
+
+    todaymonkey_write_delay_seconds: int = 0
+
+
+plugin_config = get_plugin_config(_PluginConfig)
 
 
 class _PluginLogger:
@@ -139,6 +156,20 @@ def _display_name(event: GroupMessageEvent) -> str:
     return str(sender.card or sender.nickname or event.user_id)
 
 
+def _write_delay_seconds() -> int:
+    """返回本实例配置的写库延迟秒数（副 bot 兜底机制）。"""
+    return max(0, int(plugin_config.todaymonkey_write_delay_seconds))
+
+
+async def _delayed_write(coro_factory: Any, delay: int) -> None:
+    """延迟 delay 秒后执行写库协程（后台任务，不阻塞事件处理）。"""
+    await asyncio.sleep(delay)
+    try:
+        await coro_factory()
+    except Exception:
+        logger.exception("todaymonkeytop: 延迟写库失败")
+
+
 @dataclass(frozen=True)
 class MessageOwner:
     """一条群消息及其归属用户。"""
@@ -162,10 +193,16 @@ class MonkeyStore:
         async with self.lock:
             session = get_session()
             async with session.begin():
-                record = await session.get(
-                    MonkeyMessage,
-                    (owner.bot_id, owner.group_id, owner.message_id),
-                )
+                # 按 (group_id, message_id) 查重（忽略 bot_id）：
+                # 主/副 bot 同时监听同一条消息时只保留一份记录
+                record = (
+                    await session.scalars(
+                        select(MonkeyMessage).where(
+                            MonkeyMessage.group_id == owner.group_id,
+                            MonkeyMessage.message_id == owner.message_id,
+                        )
+                    )
+                ).first()
                 if record is None:
                     session.add(
                         MonkeyMessage(
@@ -187,7 +224,15 @@ class MonkeyStore:
         async with self.lock:
             session = get_session()
             async with session.begin():
-                record = await session.get(MonkeyMessage, (bot_id, group_id, message_id))
+                # 忽略 bot_id：副 bot 能查到主 bot 记录的消息归属
+                record = (
+                    await session.scalars(
+                        select(MonkeyMessage).where(
+                            MonkeyMessage.group_id == group_id,
+                            MonkeyMessage.message_id == message_id,
+                        )
+                    )
+                ).first()
                 if record is None:
                     return None
                 return MessageOwner(
@@ -234,10 +279,17 @@ class MonkeyStore:
         async with self.lock:
             session = get_session()
             async with session.begin():
-                record = await session.get(
-                    MonkeyReaction,
-                    (owner.bot_id, owner.group_id, owner.message_id, MONKEY_EMOJI_ID),
-                )
+                # 按 (group_id, message_id, emoji_id) 查重（忽略 bot_id），
+                # 两个 bot 监听同一消息的猴榜时只保留一份最新计数
+                record = (
+                    await session.scalars(
+                        select(MonkeyReaction).where(
+                            MonkeyReaction.group_id == owner.group_id,
+                            MonkeyReaction.message_id == owner.message_id,
+                            MonkeyReaction.emoji_id == MONKEY_EMOJI_ID,
+                        )
+                    )
+                ).first()
                 if record is None:
                     session.add(
                         MonkeyReaction(
@@ -665,13 +717,24 @@ async def _track_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         user_id=event.user_id,
         nickname=_display_name(event),
     )
-    await store.save_message(owner, int(event.time) if event.time else None)
+    message_time = int(event.time) if event.time else None
+    delay = _write_delay_seconds()
+    if delay > 0:
+        # 副 bot 延迟写库：主 bot 在线时其记录先落库，本实例查重命中后跳过
+        asyncio.create_task(
+            _delayed_write(
+                lambda: store.save_message(owner, message_time), delay
+            )
+        )
+    else:
+        await store.save_message(owner, message_time)
     logger.debug(
-        "todaymonkeytop: 已记录群消息 gid={} msg={} target={} day={}",
+        "todaymonkeytop: 已记录群消息 gid={} msg={} target={} day={} delay={}",
         owner.group_id,
         owner.message_id,
         owner.user_id,
         owner.day,
+        delay,
     )
 
 
@@ -782,7 +845,16 @@ async def _track_emoji_like(bot: Bot, event: Event) -> None:
             owner.day,
         )
         return
-    await store.save_reaction_count(owner, monkey_count)
+    delay = _write_delay_seconds()
+    if delay > 0:
+        # 副 bot 延迟写库：主 bot 在线时其快照先落库，本实例查重命中后跳过
+        asyncio.create_task(
+            _delayed_write(
+                lambda: store.save_reaction_count(owner, monkey_count), delay
+            )
+        )
+    else:
+        await store.save_reaction_count(owner, monkey_count)
     logger.info(
         "todaymonkeytop: 已保存回应事件快照 gid={} msg={} target={} monkey_count={}",
         owner.group_id,

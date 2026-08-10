@@ -13,6 +13,7 @@ from unittest.mock import PropertyMock
 
 import nonebot
 import pytest
+import pytest_asyncio
 from nonebot import get_driver
 
 # ---- 在导入插件模块前初始化 NoneBot（最小配置） ----
@@ -80,3 +81,34 @@ def _reset_store_lock():
     """每个测试用例前重置 store 实例锁，避免跨用例异步锁干扰。"""
     store.lock = asyncio.Lock()
     yield
+
+
+@pytest_asyncio.fixture
+async def db_engine():
+    """内存 SQLite 引擎，用于测试 MonkeyStore 的数据库方法。"""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from nonebot_plugin_orm import Model
+
+    engine = create_async_engine("sqlite+aiosqlite://", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Model.metadata.create_all)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def db_session(db_engine, monkeypatch: pytest.MonkeyPatch):
+    """将 store 的 get_session() 指向内存库。"""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    factory = async_sessionmaker(db_engine, expire_on_commit=False)
+
+    def _get_session():
+        return factory()
+
+    monkeypatch.setattr(
+        "nonebot_plugin_todaymonkeytop.__init__.get_session",
+        _get_session,
+    )
+    yield factory
